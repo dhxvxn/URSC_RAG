@@ -27,8 +27,8 @@ import pymupdf
 import docx
 
 
-SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".xlsx", ".xls"}
-DB_PATH = os.environ.get("KNOWLEDGE_DB_PATH", "knowledge_base.db")
+SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".docm", ".xlsx", ".xls", ".csv", ".txt", ".md"}
+DB_PATH = os.environ.get("KNOWLEDGE_DB_PATH", os.environ.get("OFFLINE_QA_DB", "data/knowledge.db"))
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/chat")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3")
 MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_BYTES", str(100 * 1024 * 1024)))
@@ -66,6 +66,7 @@ def connect() -> sqlite3.Connection:
 
 def initialize(conn: sqlite3.Connection | None = None) -> None:
     owned = conn is None
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     conn = conn or sqlite3.connect(DB_PATH, timeout=30)
     conn.executescript(
         """
@@ -178,6 +179,10 @@ def extract_docx(data: bytes) -> list[tuple[str, str]]:
     return result
 
 
+def extract_text_file(data: bytes) -> list[tuple[str, str]]:
+    return [("text", data.decode("utf-8-sig", errors="replace"))]
+
+
 def extract_excel(data: bytes) -> list[tuple[str, str]]:
     sheets = pd.read_excel(io.BytesIO(data), sheet_name=None)
     result = []
@@ -194,8 +199,12 @@ def extract_document(filename: str, data: bytes) -> list[tuple[str, str]]:
         return extract_pdf(data)
     if extension == ".docx":
         return extract_docx(data)
+    if extension == ".docm":
+        return extract_docx(data)
     if extension in {".xlsx", ".xls"}:
         return extract_excel(data)
+    if extension in {".csv", ".txt", ".md"}:
+        return extract_text_file(data)
     raise ValueError(f"Unsupported document type: {extension or 'none'}")
 
 
@@ -324,6 +333,7 @@ class KnowledgeBase:
             self.db_path = db_path
         else:
             self.db_path = DB_PATH
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         if self.db_path != DB_PATH:
             connection = sqlite3.connect(self.db_path)
             initialize(connection)
@@ -417,12 +427,13 @@ class KnowledgeBase:
         resolved = Path(path).resolve()
         return self.ingest_bytes(resolved.name, resolved.read_bytes(), str(resolved))
 
-    def ingest_folder(self, folder: str | Path) -> list[dict[str, Any]]:
+    def ingest_folder(self, folder: str | Path, recursive: bool = True) -> list[dict[str, Any]]:
         root = Path(folder).resolve()
         if not root.is_dir():
             raise ValueError(f"Folder does not exist: {root}")
         results = []
-        for path in sorted(p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS):
+        candidates = root.rglob("*") if recursive else root.glob("*")
+        for path in sorted(p for p in candidates if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS):
             results.append(self.ingest_path(path))
         return results
 
@@ -562,8 +573,11 @@ async def ask_ollama(question: str, context: str, model: str | None = None) -> s
         ],
         "stream": False,
     }
-    async with httpx.AsyncClient(timeout=None) as client:
-        response = await client.post(OLLAMA_URL, json=payload)
+    try:
+        async with httpx.AsyncClient(timeout=None) as client:
+            response = await client.post(OLLAMA_URL, json=payload)
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"Ollama is unavailable: {exc}") from exc
     if response.status_code != 200:
         detail = response.json().get("error", response.text[:300])
         raise RuntimeError(f"Ollama request failed ({response.status_code}): {detail}")

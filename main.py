@@ -38,18 +38,38 @@ async def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
 
 
 class QueryRequest(BaseModel):
-    question: str = Field(min_length=2, max_length=4000)
+    question: str = Field(min_length=1, max_length=4000)
     top_k: int = Field(default=8, ge=1, le=50)
     model: str | None = None
+    use_llm: bool = True
+
+
+class FolderRequest(BaseModel):
+    folder_path: str
+    recursive: bool = True
 
 
 async def answer_question(question: str, top_k: int = 8, model: str | None = None) -> dict:
     context, sources, graph = kb.context(question, top_k)
+    llm_error = None
     try:
         answer = await ask_ollama(question, context, model)
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    return {"answer": answer, "sources": sources, "graph": graph}
+        llm_error = str(exc)
+        if not sources:
+            answer = "No matching content was found in the indexed documents."
+        else:
+            passages = "\n\n".join(f"[{s['filename']} — {s['location']}]\n{s['text']}" for s in sources[:5])
+            answer = f"Ollama is unavailable, so these relevant passages are shown instead:\n\n{passages}"
+    return {"answer": answer, "llm_used": llm_error is None, "llm_error": llm_error, "sources": sources, "graph": graph}
+
+
+def allowed_folder(path: Path) -> bool:
+    if os.environ.get("OFFLINE_QA_ALLOW_ANY_PATH", "0").lower() in {"1", "true", "yes"}:
+        return True
+    configured = os.environ.get("ALLOWED_DOCUMENT_ROOT") or os.environ.get("OFFLINE_QA_ALLOWED_ROOTS") or str(Path.cwd())
+    roots = [Path(item).expanduser().resolve() for item in configured.split(os.pathsep) if item.strip()]
+    return any(path == root or root in path.parents for root in roots)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -90,8 +110,25 @@ async def ingest_documents(files: List[UploadFile] = File(...), _: None = Depend
     return {"indexed": results, "errors": errors, "documents": kb.documents()}
 
 
+@app.post("/api/ingest/folder")
+async def ingest_folder(request: FolderRequest, _: None = Depends(require_api_key)) -> dict:
+    path = Path(request.folder_path).expanduser().resolve()
+    if not path.is_dir():
+        raise HTTPException(status_code=400, detail=f"Folder does not exist: {path}")
+    if not allowed_folder(path):
+        raise HTTPException(status_code=403, detail="Folder is outside the configured document roots")
+    try:
+        indexed = kb.ingest_folder(path, request.recursive)
+    except (ValueError, OSError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"indexed": indexed, "errors": [], "documents": kb.documents()}
+
+
 @app.post("/api/query")
 async def query_knowledge_base(request: QueryRequest, _: None = Depends(require_api_key)) -> dict:
+    if not request.use_llm:
+        _, sources, graph = kb.context(request.question, request.top_k)
+        return {"answer": "\n\n".join(f"[{s['filename']} — {s['location']}]\n{s['text']}" for s in sources), "llm_used": False, "llm_error": None, "sources": sources, "graph": graph}
     return await answer_question(request.question, request.top_k, request.model)
 
 
@@ -115,6 +152,11 @@ async def legacy_upload_and_query(
     return result
 
 
+@app.post("/api/qa/query")
+async def query_legacy_name(request: QueryRequest, _: None = Depends(require_api_key)) -> dict:
+    return await query_knowledge_base(request, _)
+
+
 @app.get("/api/documents")
 async def list_documents(_: None = Depends(require_api_key)) -> dict:
     return {"documents": kb.documents()}
@@ -133,4 +175,4 @@ async def knowledge_graph(q: str | None = None, limit: int = 30, _: None = Depen
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host=os.environ.get("HOST", "127.0.0.1"), port=int(os.environ.get("PORT", "8000")))
+    uvicorn.run("main:app", host=os.environ.get("HOST", os.environ.get("OFFLINE_QA_HOST", "127.0.0.1")), port=int(os.environ.get("PORT", os.environ.get("OFFLINE_QA_PORT", "8000"))))

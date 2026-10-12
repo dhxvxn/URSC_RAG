@@ -16,11 +16,12 @@ kb = KnowledgeBase()
 
 def allowed_folder(folder_path: str) -> Path:
     root = Path(folder_path).resolve()
-    allowed = os.environ.get("ALLOWED_DOCUMENT_ROOT")
-    if allowed:
-        permitted = Path(allowed).resolve()
-        if root != permitted and permitted not in root.parents:
-            raise ValueError(f"Folder must be inside ALLOWED_DOCUMENT_ROOT ({permitted})")
+    if os.environ.get("OFFLINE_QA_ALLOW_ANY_PATH", "0").lower() in {"1", "true", "yes"}:
+        return root
+    allowed = os.environ.get("ALLOWED_DOCUMENT_ROOT") or os.environ.get("OFFLINE_QA_ALLOWED_ROOTS") or str(Path.cwd())
+    roots = [Path(item).expanduser().resolve() for item in allowed.split(os.pathsep) if item.strip()]
+    if not any(root == permitted or permitted in root.parents for permitted in roots):
+        raise ValueError(f"Folder must be inside an approved document root ({', '.join(map(str, roots))})")
     return root
 
 
@@ -51,7 +52,9 @@ async def query_knowledge_base(question: str, top_k: int = 8) -> str:
     try:
         return await answer(question, top_k)
     except RuntimeError as exc:
-        return f"Error: {exc}"
+        context, sources, _ = kb.context(question, top_k)
+        passages = "\n\n".join(f"[{s['filename']} — {s['location']}]\n{s['text']}" for s in sources[:5])
+        return f"Ollama unavailable ({exc}). Relevant passages:\n\n{passages}" if passages else f"Error: {exc}"
 
 
 @mcp.tool()
@@ -63,13 +66,26 @@ async def query_local_documents(folder_path: str, question: str) -> str:
     try:
         return await answer(question)
     except RuntimeError as exc:
-        return f"Error: {exc}"
+        return await query_knowledge_base(question)
 
 
 @mcp.tool()
 def knowledge_graph(query: str = "", limit: int = 30) -> str:
     """Return topic and entity relationships with query-relevant graph seeds."""
     return str(kb.graph(query or None, max(1, min(limit, 100))))
+
+
+@mcp.tool()
+async def search_knowledge_base(question: str, top_k: int = 8) -> str:
+    """Compatibility alias for clients that call the search tool by this name."""
+    context, sources, graph = kb.context(question, top_k)
+    return str({"sources": sources, "topics": graph["topics"], "context": context})
+
+
+@mcp.tool()
+def get_knowledge_graph(query: str = "", limit: int = 30) -> str:
+    """Compatibility alias for graph clients."""
+    return knowledge_graph(query, limit)
 
 
 if __name__ == "__main__":
