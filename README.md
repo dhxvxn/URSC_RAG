@@ -1,32 +1,70 @@
-\# Offline Multi-Document QA System \& MCP Server
+# Offline Document Knowledge Base
 
+This is a local-first document retrieval system for secure Ubuntu/Linux offices. It indexes PDF, Word, Excel, CSV, Markdown, and text files into a persistent SQLite database. Files are identified by SHA-256, so the same document is skipped after its first successful ingestion.
 
+The index contains:
 
-A fully offline, privacy-first AI question-answering system that scans local folders containing PDF, Word (docx), and Excel (xlsx) files. It features both a FastAPI web interface and a Model Context Protocol (MCP) server for direct integration with AI assistants like Claude Desktop.
+- extracted document chunks with page references where available;
+- a SQLite FTS5 full-text index for fast local search;
+- document and chunk topic terms;
+- a topic co-occurrence graph for related-topic exploration;
+- optional local Ollama answer generation grounded in retrieved passages.
 
+No document data is sent to a cloud service. If Ollama is unavailable, the API still returns ranked passages from the local index.
 
+## Ubuntu/Linux setup
 
-\## Features
+```bash
+sudo apt update
+sudo apt install -y python3-venv
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 
-\* \*\*100% Offline:\*\* Uses local Llama 3 via Ollama. No data leaves your machine.
+# Optional local answer model
+ollama pull llama3
+python main.py
+```
 
-\* \*\*Multi-Format Support:\*\* Reads PDFs (PyMuPDF), Word docs (python-docx), and Excel sheets (pandas).
+Open `http://127.0.0.1:8000`. For a server on an office network, set `OFFLINE_QA_HOST=0.0.0.0` and put the service behind the office firewall or a reverse proxy with authentication.
 
-\* \*\*OCR Integrated:\*\* Extracts text from image-based PDFs using EasyOCR.
+## One-time ingestion
 
-\* \*\*Smart Caching:\*\* Hashes and caches extracted text to prevent redundant processing.
+Use the web page's **Server-side folder path** field or call the API directly:
 
-\* \*\*Dual Interfaces:\*\* Includes a local web GUI (`main.py`) and a Claude Desktop MCP Tool (`mcp\_server.py`).
+```bash
+curl -X POST http://127.0.0.1:8000/api/ingest/folder \
+  -H 'Content-Type: application/json' \
+  -d '{"folder_path":"/srv/office-documents","recursive":true}'
+```
 
+The database is stored at `data/knowledge.db` by default. Change it with `OFFLINE_QA_DB=/secure/path/knowledge.db`. By default, folder ingestion is limited to the current working directory. Set `OFFLINE_QA_ALLOWED_ROOTS=/srv/office-documents:/opt/shared-docs` to allow approved roots. For a trusted isolated deployment only, `OFFLINE_QA_ALLOW_ANY_PATH=1` disables that path check.
 
+Ingesting the same folder again is safe: unchanged files return `already_indexed`; changed files get a new hash and are indexed as a new version. Uploaded files use the same deduplication logic.
 
-\## Setup
+## Query and graph APIs
 
-1\. Install \[Ollama](https://ollama.com/) and run `ollama run llama3`.
+```bash
+curl -X POST http://127.0.0.1:8000/api/qa/query \
+  -H 'Content-Type: application/json' \
+  -d '{"question":"Which documents describe the procurement budget?","top_k":8}'
 
-2\. Install dependencies: `pip install fastapi uvicorn mcp pymupdf easyocr python-docx pandas openpyxl httpx numpy`.
+curl http://127.0.0.1:8000/api/graph
+curl 'http://127.0.0.1:8000/api/graph?topic=procurement'
+```
 
-3\. Run the web GUI: `python main.py`
+The query response includes an answer, ranked source chunks, and related topics. With Ollama running, the answer is generated locally from the retrieved context. Without it, the response is extractive and still includes the source passages.
 
-4\. Or configure `mcp\_server.py` in your Claude Desktop `claude\_desktop\_config.json` to use it directly in chat.
+## MCP server
 
+The MCP server uses the same `data/knowledge.db` as the web API. It exposes `ingest_local_folder`, `search_knowledge_base`, `query_local_documents`, and `get_knowledge_graph`.
+
+```bash
+python mcp_server.py
+```
+
+Configure the command in an MCP-compatible desktop client with the absolute path to the repository's Python interpreter and `mcp_server.py`.
+
+## OCR and security notes
+
+Text-based PDFs work without extra model downloads. To OCR scanned PDFs, install the optional `easyocr` dependency and set `OFFLINE_QA_ENABLE_OCR=1`; the OCR model is loaded locally and cached by EasyOCR. Keep the service bound to `127.0.0.1` unless the office network and reverse proxy are configured deliberately.
