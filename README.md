@@ -1,32 +1,27 @@
-\# Offline Multi-Document QA System \& MCP Server
+# Offline Office Knowledge Base
 
+A privacy-first local knowledge base for PDF, Word, and Excel files. Documents are indexed once into a portable SQLite database and queried through a FastAPI web interface or an MCP server.
 
+## Features
 
-A fully offline, privacy-first AI question-answering system that scans local folders containing PDF, Word (docx), and Excel (xlsx) files. It features both a FastAPI web interface and a Model Context Protocol (MCP) server for direct integration with AI assistants like Claude Desktop.
+- Offline Ollama inference; document content stays on the office machine.
+- PDF, DOCX, XLSX, and XLS extraction, including OCR for image-only PDF pages.
+- SHA-256 document identity so unchanged files are not extracted again.
+- Chunked source-aware storage with page, paragraph, table, or sheet locations.
+- SQLite FTS5 keyword search plus a local vector index with an offline hashing fallback.
+- Topic extraction, entity extraction, co-occurrence relationships, and source provenance.
+- Web API and MCP tools for ingestion, querying, document management, and graph inspection.
 
+## Setup
 
+1. Install Ollama and run `ollama pull llama3` once.
+2. Install dependencies: `pip install fastapi uvicorn 'mcp<2' pymupdf easyocr python-docx pandas openpyxl httpx numpy python-multipart`.
+3. Run the web GUI with `python main.py`.
+4. Ingest documents once, then query the index. The database is `knowledge_base.db` by default.
+5. Configure `mcp_server.py` in your MCP client for folder ingestion and persistent queries.
 
-\## Features
+## API
 
-\* \*\*100% Offline:\*\* Uses local Llama 3 via Ollama. No data leaves your machine.
+`POST /api/ingest` indexes files once. `POST /api/search` returns retrieval evidence without an LLM, while `POST /api/query` searches the persistent index and asks Ollama. `GET /api/documents` lists indexed files, `DELETE /api/documents/{sha256}` removes one, and `GET /api/graph?q=topic` returns related topics and entities.
 
-\* \*\*Multi-Format Support:\*\* Reads PDFs (PyMuPDF), Word docs (python-docx), and Excel sheets (pandas).
-
-\* \*\*OCR Integrated:\*\* Extracts text from image-based PDFs using EasyOCR.
-
-\* \*\*Smart Caching:\*\* Hashes and caches extracted text to prevent redundant processing.
-
-\* \*\*Dual Interfaces:\*\* Includes a local web GUI (`main.py`) and a Claude Desktop MCP Tool (`mcp\_server.py`).
-
-
-
-\## Setup
-
-1\. Install \[Ollama](https://ollama.com/) and run `ollama run llama3`.
-
-2\. Install dependencies: `pip install fastapi uvicorn mcp pymupdf easyocr python-docx pandas openpyxl httpx numpy`.
-
-3\. Run the web GUI: `python main.py`
-
-4\. Or configure `mcp\_server.py` in your Claude Desktop `claude\_desktop\_config.json` to use it directly in chat.
-
+Set `KNOWLEDGE_DB_PATH` to place the database outside the checkout, `OLLAMA_MODEL` to select a local model, `EMBEDDING_MODEL` to use an installed sentence-transformers model, `OFFICE_API_KEY` to require an `X-API-Key`, and `ALLOWED_DOCUMENT_ROOT` to restrict MCP folder access.

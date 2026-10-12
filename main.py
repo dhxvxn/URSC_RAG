@@ -1,166 +1,136 @@
+"""FastAPI interface for the persistent offline knowledge base."""
+
+from __future__ import annotations
+
 import os
-import glob
-import json
-import hashlib
-import io
-import pymupdf
-import easyocr
-import docx
-import pandas as pd
-import uvicorn
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import HTMLResponse
+from pathlib import Path
 from typing import List
-import httpx
-import numpy as np
 
-app = FastAPI(title="Offline Multi-Format QA API")
-reader = easyocr.Reader(['en']) 
-OLLAMA_URL = "http://localhost:11434/api/chat"
+import uvicorn
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
 
-# --- CACHING SETUP ---
-CACHE_DIR = "doc_cache"
-REGISTRY_FILE = os.path.join(CACHE_DIR, "registry.json")
-os.makedirs(CACHE_DIR, exist_ok=True)
+from knowledge_base import KnowledgeBase, ask_ollama, extract_docx, extract_excel, extract_pdf
 
-def load_registry() -> dict:
-    if os.path.exists(REGISTRY_FILE):
-        with open(REGISTRY_FILE, "r") as f: return json.load(f)
-    return {}
 
-def save_registry(registry: dict):
-    with open(REGISTRY_FILE, "w") as f: json.dump(registry, f, indent=4)
+app = FastAPI(title="Offline Office Knowledge Base", version="2.0")
+kb = KnowledgeBase()
 
-def get_upload_hash(file_bytes: bytes) -> str:
-    return hashlib.md5(file_bytes).hexdigest()
 
-# --- TEXT EXTRACTION ---
+# Compatibility helpers for callers of the original prototype.
 def extract_text_from_pdf(file_bytes: bytes) -> str:
-    doc = pymupdf.open(stream=file_bytes, filetype="pdf")
-    extracted_text = ""
-    for page in doc:
-        text = page.get_text().strip()
-        if text: extracted_text += text + "\n"
-        else:
-            pix = page.get_pixmap()
-            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
-            ocr_result = reader.readtext(img, detail=0)
-            extracted_text += " ".join(ocr_result) + "\n"
-    return extracted_text
+    return "\n".join(text for _, text in extract_pdf(file_bytes))
+
 
 def extract_text_from_docx(file_bytes: bytes) -> str:
-    doc = docx.Document(io.BytesIO(file_bytes))
-    return "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
+    return "\n".join(text for _, text in extract_docx(file_bytes))
+
 
 def extract_text_from_excel(file_bytes: bytes) -> str:
-    sheets = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None)
-    extracted_text = ""
-    for sheet_name, df in sheets.items():
-        extracted_text += f"\n--- Excel Sheet: {sheet_name} ---\n"
-        extracted_text += df.to_string(index=False) + "\n"
-    return extracted_text
+    return "\n".join(text for _, text in extract_excel(file_bytes))
 
-async def query_ollama(context: str, question: str) -> str:
-    payload = {
-        "model": "llama3",
-        "messages": [
-            {"role": "system", "content": "You are a highly intelligent analytical assistant. Provide a highly detailed, comprehensive, and thorough answer based ONLY on the provided document context. Explain your reasoning fully and do not give brief summaries."},
-            {"role": "user", "content": f"Context:\n{context[:7000]}\n\nQuestion: {question}"}
-        ],
-        "stream": False
-    }
-    async with httpx.AsyncClient() as client:
-        response = await client.post(OLLAMA_URL, json=payload, timeout=None)
-        return response.json().get("message", {}).get("content", "").strip()
 
-# --- WEB INTERFACE ---
+async def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
+    configured = os.environ.get("OFFICE_API_KEY")
+    if configured and x_api_key != configured:
+        raise HTTPException(status_code=401, detail="A valid X-API-Key is required")
+
+
+class QueryRequest(BaseModel):
+    question: str = Field(min_length=2, max_length=4000)
+    top_k: int = Field(default=8, ge=1, le=50)
+    model: str | None = None
+
+
+async def answer_question(question: str, top_k: int = 8, model: str | None = None) -> dict:
+    context, sources, graph = kb.context(question, top_k)
+    try:
+        answer = await ask_ollama(question, context, model)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"answer": answer, "sources": sources, "graph": graph}
+
+
 @app.get("/", response_class=HTMLResponse)
-async def get_web_interface():
+async def get_web_interface() -> str:
     return """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Offline Multi-Document QA System</title>
-        <style>
-            body { font-family: Arial, sans-serif; max-width: 800px; margin: 40px auto; padding: 20px; background-color: #f4f7f6; }
-            .container { background: white; padding: 30px; border-radius: 10px; box-shadow: 0px 4px 10px rgba(0,0,0,0.1); }
-            input[type="text"], input[type="file"] { width: 100%; padding: 10px; margin: 10px 0; border: 1px solid #ccc; border-radius: 5px; box-sizing: border-box; }
-            button { background-color: #0056b3; color: white; padding: 12px 20px; border: none; border-radius: 5px; cursor: pointer; width: 100%; font-size: 16px;}
-            #result { margin-top: 20px; padding: 15px; background: #e8f5e9; border-radius: 5px; display: none; white-space: pre-wrap; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h2>Offline Document QA (PDF, Word, Excel)</h2>
-            <form id="uploadForm">
-                <label><b>1. Select a Folder:</b></label><br>
-                <input type="file" id="folderInput" name="files" webkitdirectory directory multiple required>
-                <label><b>2. Ask your question:</b></label><br>
-                <input type="text" id="questionInput" name="question" required>
-                <button type="submit">Scan Folder & Ask</button>
-            </form>
-            <div id="result"></div>
-        </div>
-        <script>
-            document.getElementById('uploadForm').onsubmit = async function(e) {
-                e.preventDefault();
-                let resultDiv = document.getElementById('result');
-                resultDiv.style.display = 'block';
-                resultDiv.innerHTML = "<i>Scanning documents... Please wait.</i>";
-                
-                let formData = new FormData();
-                let files = document.getElementById('folderInput').files;
-                let validExtensions = ['.pdf', '.docx', '.xlsx', '.xls'];
-                
-                for(let i=0; i<files.length; i++) {
-                    let fileName = files[i].name.toLowerCase();
-                    if(validExtensions.some(ext => fileName.endsWith(ext))) {
-                        formData.append('files', files[i]);
-                    }
-                }
-                formData.append('question', document.getElementById('questionInput').value);
-
-                let response = await fetch('/api/qa/upload_folder', { method: 'POST', body: formData });
-                let data = await response.json();
-                resultDiv.innerHTML = "<b>AI Answer:</b><br>" + data.answer + "<br><br><b>Documents Read:</b><br>" + data.files_used.join("<br>");
-            };
-        </script>
-    </body>
-    </html>
+    <!doctype html><html><head><meta charset="utf-8"><title>Office Knowledge Base</title>
+    <style>body{font-family:Arial;max-width:900px;margin:35px auto;padding:20px;background:#f4f7f6}.box{background:white;padding:25px;border-radius:10px;box-shadow:0 2px 10px #ccc}input,button{width:100%;box-sizing:border-box;padding:11px;margin:7px 0}button{background:#0759a5;color:#fff;border:0;border-radius:4px;cursor:pointer}.result{white-space:pre-wrap;background:#eef7ee;padding:14px;margin-top:15px}.small{color:#555;font-size:.9em}</style></head>
+    <body><div class="box"><h2>Offline Office Knowledge Base</h2>
+    <p class="small">Ingest documents once. Later questions search the persistent local index.</p>
+    <form id="ingest"><label>Documents (PDF, Word, Excel)</label><input id="files" type="file" multiple required><button>Index documents</button></form>
+    <form id="query"><label>Question</label><input id="question" required placeholder="Ask about an indexed topic"><button>Search and answer</button></form>
+    <div id="result" class="result" hidden></div></div>
+    <script>
+    const out=document.getElementById('result'); const show=x=>{out.hidden=false;out.textContent=typeof x==='string'?x:JSON.stringify(x,null,2)};
+    document.getElementById('ingest').onsubmit=async e=>{e.preventDefault();const f=new FormData();for(const x of document.getElementById('files').files)f.append('files',x);show('Indexing…');const r=await fetch('/api/ingest',{method:'POST',body:f});show(await r.json())};
+    document.getElementById('query').onsubmit=async e=>{e.preventDefault();show('Searching…');const r=await fetch('/api/query',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:document.getElementById('question').value})});show(await r.json())};
+    </script></body></html>
     """
 
-# --- BACKEND ROUTER ---
+
+@app.get("/api/health")
+async def health(_: None = Depends(require_api_key)) -> dict:
+    return {"status": "ok", "database": kb.db_path, "documents": len(kb.documents())}
+
+
+@app.post("/api/ingest")
+async def ingest_documents(files: List[UploadFile] = File(...), _: None = Depends(require_api_key)) -> dict:
+    results = []
+    errors = []
+    for upload in files:
+        try:
+            data = await upload.read()
+            results.append(kb.ingest_bytes(Path(upload.filename or "document").name, data))
+        except (ValueError, OSError, RuntimeError) as exc:
+            errors.append({"filename": upload.filename, "error": str(exc)})
+    if not results and errors:
+        raise HTTPException(status_code=400, detail=errors)
+    return {"indexed": results, "errors": errors, "documents": kb.documents()}
+
+
+@app.post("/api/query")
+async def query_knowledge_base(request: QueryRequest, _: None = Depends(require_api_key)) -> dict:
+    return await answer_question(request.question, request.top_k, request.model)
+
+
+@app.post("/api/search")
+async def search_index(request: QueryRequest, _: None = Depends(require_api_key)) -> dict:
+    """Return retrieval and graph evidence without requiring an LLM."""
+    _, sources, graph = kb.context(request.question, request.top_k)
+    return {"sources": sources, "graph": graph}
+
+
 @app.post("/api/qa/upload_folder")
-async def process_html_folder_upload(question: str = Form(...), files: List[UploadFile] = File(...)):
-    registry = load_registry()
-    combined_context = ""
-    processed_files = []
-    
-    for file in files:
-        ext = os.path.splitext(file.filename)[1].lower()
-        file_bytes = await file.read()
-        file_hash = get_upload_hash(file_bytes)
-        cache_file_path = os.path.join(CACHE_DIR, f"{file_hash}.txt")
-        
-        if os.path.exists(cache_file_path):
-            with open(cache_file_path, "r", encoding="utf-8") as f: text = f.read()
-        else:
-            try:
-                if ext == ".pdf": text = extract_text_from_pdf(file_bytes)
-                elif ext == ".docx": text = extract_text_from_docx(file_bytes)
-                elif ext in [".xlsx", ".xls"]: text = extract_text_from_excel(file_bytes)
-                else: continue
-                with open(cache_file_path, "w", encoding="utf-8") as f: f.write(text)
-                registry[file_hash] = {"name": file.filename}
-            except Exception: continue
-            
-        combined_context += f"\n--- Source: {file.filename} ---\n" + text
-        processed_files.append(file.filename)
-        
-    save_registry(registry)
-    if not combined_context: return {"files_used": [], "answer": "No valid files found."}
-    answer = await query_ollama(combined_context, question)
-    return {"files_used": processed_files, "answer": answer}
+async def legacy_upload_and_query(
+    question: str = Form(...), files: List[UploadFile] = File(...), _: None = Depends(require_api_key)
+) -> dict:
+    """Backward-compatible route: indexes new files, then searches the complete index."""
+    ingestion = await ingest_documents(files)
+    result = await answer_question(question)
+    result["indexed"] = ingestion["indexed"]
+    result["errors"] = ingestion["errors"]
+    result["files_used"] = [source["filename"] for source in result["sources"]]
+    return result
+
+
+@app.get("/api/documents")
+async def list_documents(_: None = Depends(require_api_key)) -> dict:
+    return {"documents": kb.documents()}
+
+
+@app.delete("/api/documents/{document_id}")
+async def delete_document(document_id: str, _: None = Depends(require_api_key)) -> dict:
+    if not kb.remove_document(document_id):
+        raise HTTPException(status_code=404, detail="Document not found")
+    return {"deleted": document_id}
+
+
+@app.get("/api/graph")
+async def knowledge_graph(q: str | None = None, limit: int = 30, _: None = Depends(require_api_key)) -> dict:
+    return kb.graph(q, max(1, min(limit, 100)))
+
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000)
+    uvicorn.run("main:app", host=os.environ.get("HOST", "127.0.0.1"), port=int(os.environ.get("PORT", "8000")))

@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+mcp<2
+pymupdf
+easyocr
+python-docx
+pandas
+openpyxl
+xlrd
+httpx
+numpy
+python-multipart
