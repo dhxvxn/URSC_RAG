@@ -3,3 +3,4 @@ doc_cache/
 Test_Documents/
 *.pyc
 .env
+.venv/
