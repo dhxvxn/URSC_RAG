@@ -3,9 +3,3 @@ doc_cache/
 Test_Documents/
 *.pyc
 .env
-.venv/
-data/
-documents/
-knowledge_base.db
-knowledge_base.db-*
-requirements.lock

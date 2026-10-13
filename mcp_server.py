@@ -1,92 +1,126 @@
-"""MCP tools backed by the same persistent database as the web API."""
-
-from __future__ import annotations
-
 import os
-from pathlib import Path
-
+import json
+import hashlib
+import io
+import pymupdf
+import easyocr
+import docx
+import pandas as pd
+import httpx
+import numpy as np
 from mcp.server.fastmcp import FastMCP
 
-from knowledge_base import KnowledgeBase, ask_ollama
+# Initialize the MCP Server
+mcp = FastMCP("Local_Document_QA_Server")
 
+reader = easyocr.Reader(['en']) 
+OLLAMA_URL = "http://localhost:11434/api/chat"
 
-mcp = FastMCP("Local_Office_Knowledge_Base")
-kb = KnowledgeBase()
+# --- CACHING SETUP ---
+CACHE_DIR = "doc_cache"
+REGISTRY_FILE = os.path.join(CACHE_DIR, "registry.json")
+os.makedirs(CACHE_DIR, exist_ok=True)
 
+def load_registry() -> dict:
+    if os.path.exists(REGISTRY_FILE):
+        with open(REGISTRY_FILE, "r") as f: return json.load(f)
+    return {}
 
-def allowed_folder(folder_path: str) -> Path:
-    root = Path(folder_path).resolve()
-    if os.environ.get("OFFLINE_QA_ALLOW_ANY_PATH", "0").lower() in {"1", "true", "yes"}:
-        return root
-    allowed = os.environ.get("ALLOWED_DOCUMENT_ROOT") or os.environ.get("OFFLINE_QA_ALLOWED_ROOTS") or str(Path.cwd())
-    roots = [Path(item).expanduser().resolve() for item in allowed.split(os.pathsep) if item.strip()]
-    if not any(root == permitted or permitted in root.parents for permitted in roots):
-        raise ValueError(f"Folder must be inside an approved document root ({', '.join(map(str, roots))})")
-    return root
+def save_registry(registry: dict):
+    with open(REGISTRY_FILE, "w") as f: json.dump(registry, f, indent=4)
 
+def get_file_hash(file_path: str) -> str:
+    with open(file_path, "rb") as f:
+        return hashlib.md5(f.read()).hexdigest()
 
-async def answer(question: str, top_k: int = 8) -> str:
-    context, sources, graph = kb.context(question, top_k)
-    response = await ask_ollama(question, context)
-    source_lines = "\n".join(f"- {s['filename']} ({s['location']})" for s in sources)
-    return f"{response}\n\nSources:\n{source_lines}\n\nRelated topics: {', '.join(t['display_name'] for t in graph['topics'][:10])}"
+# --- TEXT EXTRACTION ---
+def extract_text_from_pdf(file_path: str) -> str:
+    doc = pymupdf.open(file_path)
+    extracted_text = ""
+    for page in doc:
+        text = page.get_text().strip()
+        if text: extracted_text += text + "\n"
+        else:
+            pix = page.get_pixmap()
+            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+            ocr_result = reader.readtext(img, detail=0)
+            extracted_text += " ".join(ocr_result) + "\n"
+    return extracted_text
 
+def extract_text_from_docx(file_path: str) -> str:
+    doc = docx.Document(file_path)
+    return "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
 
-@mcp.tool()
-def ingest_local_folder(folder_path: str) -> str:
-    """Index PDF, Word, and Excel files in a local folder once.
+def extract_text_from_excel(file_path: str) -> str:
+    sheets = pd.read_excel(file_path, sheet_name=None)
+    extracted_text = ""
+    for sheet_name, df in sheets.items():
+        extracted_text += f"\n--- Excel Sheet: {sheet_name} ---\n"
+        extracted_text += df.to_string(index=False) + "\n"
+    return extracted_text
 
-    Files are identified by SHA-256 content hash, so repeating this operation
-    does not extract or index unchanged documents again.
-    """
-    try:
-        results = kb.ingest_folder(allowed_folder(folder_path))
-        return str({"documents": results, "database": kb.db_path})
-    except (ValueError, OSError, RuntimeError) as exc:
-        return f"Error: {exc}"
+async def query_ollama(context: str, question: str) -> str:
+    payload = {
+        "model": "llama3",
+        "messages": [
+            {"role": "system", "content": "You are a highly intelligent analytical assistant. Provide a highly detailed answer based ONLY on the provided document context."},
+            {"role": "user", "content": f"Context:\n{context[:7000]}\n\nQuestion: {question}"}
+        ],
+        "stream": False
+    }
+    async with httpx.AsyncClient() as client:
+        response = await client.post(OLLAMA_URL, json=payload, timeout=None)
+        return response.json().get("message", {}).get("content", "").strip()
 
-
-@mcp.tool()
-async def query_knowledge_base(question: str, top_k: int = 8) -> str:
-    """Search indexed documents with hybrid keyword and semantic retrieval."""
-    try:
-        return await answer(question, top_k)
-    except RuntimeError as exc:
-        context, sources, _ = kb.context(question, top_k)
-        passages = "\n\n".join(f"[{s['filename']} — {s['location']}]\n{s['text']}" for s in sources[:5])
-        return f"Ollama unavailable ({exc}). Relevant passages:\n\n{passages}" if passages else f"Error: {exc}"
-
-
+# --- MCP TOOL REGISTRATION ---
 @mcp.tool()
 async def query_local_documents(folder_path: str, question: str) -> str:
-    """Index a folder if needed, then answer from the persistent knowledge base."""
-    ingest_result = ingest_local_folder(folder_path)
-    if ingest_result.startswith("Error:"):
-        return ingest_result
-    try:
-        return await answer(question)
-    except RuntimeError as exc:
-        return await query_knowledge_base(question)
+    """
+    Scans a local folder for PDF, Word, and Excel files, reads their contents, 
+    and answers a specific question using a local Ollama AI model.
+    """
+    if not os.path.exists(folder_path):
+        return f"Error: The folder '{folder_path}' does not exist."
 
+    registry = load_registry()
+    combined_context = ""
+    valid_extensions = ['.pdf', '.docx', '.xlsx', '.xls']
+    
+    # Iterate through files in the specified local directory
+    for filename in os.listdir(folder_path):
+        ext = os.path.splitext(filename)[1].lower()
+        if ext not in valid_extensions:
+            continue
+            
+        file_path = os.path.join(folder_path, filename)
+        file_hash = get_file_hash(file_path)
+        cache_file_path = os.path.join(CACHE_DIR, f"{file_hash}.txt")
+        
+        # Check Cache
+        if os.path.exists(cache_file_path):
+            with open(cache_file_path, "r", encoding="utf-8") as f: text = f.read()
+        else:
+            try:
+                if ext == ".pdf": text = extract_text_from_pdf(file_path)
+                elif ext == ".docx": text = extract_text_from_docx(file_path)
+                elif ext in [".xlsx", ".xls"]: text = extract_text_from_excel(file_path)
+                
+                with open(cache_file_path, "w", encoding="utf-8") as f: f.write(text)
+                registry[file_hash] = {"name": filename}
+            except Exception as e:
+                continue
+                
+        combined_context += f"\n--- Source: {filename} ---\n" + text
+        
+    save_registry(registry)
+    
+    if not combined_context:
+        return "No valid documents found in the folder."
 
-@mcp.tool()
-def knowledge_graph(query: str = "", limit: int = 30) -> str:
-    """Return topic and entity relationships with query-relevant graph seeds."""
-    return str(kb.graph(query or None, max(1, min(limit, 100))))
-
-
-@mcp.tool()
-async def search_knowledge_base(question: str, top_k: int = 8) -> str:
-    """Compatibility alias for clients that call the search tool by this name."""
-    context, sources, graph = kb.context(question, top_k)
-    return str({"sources": sources, "topics": graph["topics"], "context": context})
-
-
-@mcp.tool()
-def get_knowledge_graph(query: str = "", limit: int = 30) -> str:
-    """Compatibility alias for graph clients."""
-    return knowledge_graph(query, limit)
-
+    # Ask the local Ollama model
+    answer = await query_ollama(combined_context, question)
+    return answer
 
 if __name__ == "__main__":
+    # Runs the MCP server listening on standard input/output
     mcp.run()
