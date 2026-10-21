@@ -139,6 +139,101 @@ docker compose build
 docker compose up -d
 ```
 
+## Windows installation with Docker Desktop
+
+Windows 10/11 can run the same Linux containers through Docker Desktop and WSL2. Internet is needed for Docker Desktop, the first image build, and the model downloads. After that, the stack can run offline.
+
+### 1. Install WSL2
+
+Open **PowerShell as Administrator**:
+
+```powershell
+wsl --install
+wsl --update
+```
+
+Restart Windows when prompted. Open the installed Ubuntu distribution once and create its Linux username and password.
+
+### 2. Install Docker Desktop
+
+In PowerShell:
+
+```powershell
+winget install --id Docker.DockerDesktop --exact
+```
+
+Start **Docker Desktop** and confirm:
+
+- **Use the WSL 2 based engine** is enabled.
+- **Settings → Resources → WSL Integration** is enabled for your Ubuntu distribution.
+- Docker Desktop reports **Engine running**.
+
+Verify from PowerShell:
+
+```powershell
+docker --version
+docker compose version
+docker run --rm hello-world
+```
+
+### 3. Clone and build the project
+
+Run these commands in PowerShell:
+
+```powershell
+git clone https://github.com/dhxvxn/URSC_RAG.git
+cd URSC_RAG
+
+docker compose build
+docker compose up -d
+
+docker compose exec ollama ollama pull llama3.2:3b
+docker compose exec ollama ollama pull llava:7b
+
+docker compose ps
+curl.exe http://127.0.0.1:8000/health
+```
+
+Open the application at [http://127.0.0.1:8000](http://127.0.0.1:8000) and the API page at [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs).
+
+The default Windows deployment is loopback-only, so other computers cannot connect. The named Docker volumes `ursc_rag_rag_data` and `ursc_rag_ollama_models` persist across Docker Desktop restarts and Windows reboots.
+
+### 4. Run offline
+
+After the image build and both model pulls finish, disconnect Windows from the internet. Start the application later with:
+
+```powershell
+cd URSC_RAG
+docker compose up -d
+```
+
+Do not run `docker compose build` or `ollama pull` on the disconnected machine. Do not run `docker compose down -v`; that removes the document database, embeddings, and uploaded files.
+
+### 5. Optional Windows lab-network access
+
+For a later lab demonstration, create a file named `.env` beside `docker-compose.yml`:
+
+```dotenv
+RAG_BIND_ADDRESS=0.0.0.0
+```
+
+Restart Docker Compose:
+
+```powershell
+docker compose up -d
+ipconfig
+```
+
+Restrict Windows Firewall to the lab subnet from an Administrator PowerShell:
+
+```powershell
+New-NetFirewallRule -DisplayName "Offline Document QA" -Direction Inbound -Protocol TCP -LocalPort 8000 -RemoteAddress 192.168.10.0/24 -Action Allow
+```
+
+Lab workstations can then open `http://WINDOWS_SERVER_IP:8000`. Keep port 11434 private; only the FastAPI port should be reachable from the lab.
+
+
+
 
 ## First demonstration on one Ubuntu PC
 
