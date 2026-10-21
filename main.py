@@ -2,7 +2,7 @@
 
 The service is deliberately self-contained: SQLite stores the document registry,
 notebook membership, chunks, and embeddings. The only network call made while
-answering a question is to the Ollama container on the local Docker network.
+answering a question is to the local Ollama service.
 """
 
 from __future__ import annotations
@@ -35,14 +35,15 @@ from sentence_transformers import SentenceTransformer
 
 
 APP_TITLE = "Offline Notebook Document QA"
-DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
+APP_DIR = Path(__file__).resolve().parent
+DATA_DIR = Path(os.getenv("DATA_DIR", str(APP_DIR / "data")))
 DB_PATH = Path(os.getenv("DB_PATH", str(DATA_DIR / "knowledge.sqlite3")))
 DOCUMENT_DIR = DATA_DIR / "documents"
 IMAGE_DIR = DATA_DIR / "images"
-MODEL_DIR = Path(os.getenv("EMBEDDING_MODEL_DIR", str(DATA_DIR / "models" / "embeddings")))
-OCR_MODEL_DIR = Path(os.getenv("EASYOCR_MODULE_PATH", str(DATA_DIR / "models" / "easyocr")))
+MODEL_DIR = Path(os.getenv("EMBEDDING_MODEL_DIR", str(APP_DIR / "models" / "embeddings")))
+OCR_MODEL_DIR = Path(os.getenv("EASYOCR_MODULE_PATH", str(APP_DIR / "models" / "easyocr")))
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434").rstrip("/")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
 OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "llava:7b")
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "-1")

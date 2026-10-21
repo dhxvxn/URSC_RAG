@@ -1,8 +1,8 @@
 # Offline Notebook Document QA
 
-This project is a private, Docker-based document question-answering system for a lab or secure office. It accepts PDF, Word, Excel, and image files, extracts text and OCR content, creates local embeddings once, and stores everything in persistent Docker volumes. Questions are scoped to a selected notebook, so a user can keep separate collections such as **Propulsion**, **Mission Reports**, or **Finance**.
+This project is a private document question-answering system for a lab or secure office. It can run with Docker or as a native Python and Ollama service. It accepts PDF, Word, Excel, and image files, extracts text and OCR content, creates local embeddings once, and stores everything in a persistent local data directory. Questions are scoped to a selected notebook, so a user can keep separate collections such as **Propulsion**, **Mission Reports**, or **Finance**.
 
-The application runs locally with FastAPI and Ollama. After the connected installation is complete, the containers, embedding model, OCR model, language model, documents, images, SQLite catalog, and embeddings can run without internet access.
+The application runs locally with FastAPI and Ollama. After the connected installation is complete, the application, embedding model, OCR model, language model, documents, images, SQLite catalog, and embeddings can run without internet access.
 
 ## What is included
 
@@ -19,7 +19,194 @@ The application runs locally with FastAPI and Ollama. After the connected instal
 - FastAPI web UI, Swagger API at `/docs`, and MCP tools for notebook operations.
 - No cloud API is needed at runtime.
 
-The persistent data is kept in the Docker volume `rag_data`; Ollama model files are kept in `ollama_models`. Removing containers does not remove these volumes.
+With Docker, persistent data is kept in the `rag_data` volume and Ollama model files are kept in `ollama_models`. With native deployment, the same data is stored under the repository's `data/` and `models/` directories. Do not delete these directories.
+
+## Recommended deployment without Docker
+
+For a simple offline installation, use native Python and Ollama. This avoids Docker Desktop, WSL, Hyper-V, and Compose. The FastAPI application runs from a virtual environment, SQLite stores the notebooks and embeddings in `data/`, and the embedding, OCR, and Ollama model files stay under `models/`.
+
+The connected preparation machine and the isolated deployment machine must use the same operating-system family and CPU architecture. Prepare a Windows bundle for Windows or an Ubuntu bundle for Ubuntu. Do not copy a virtual environment between operating systems; create it again from the copied wheel files.
+
+### Native requirements
+
+- Windows 10/11 or Ubuntu 22.04/24.04.
+- Python 3.11 or newer from [python.org/downloads](https://www.python.org/downloads/).
+- Ollama installed natively from [ollama.com/download](https://ollama.com/download).
+- At least 16 GB RAM is recommended. An 8 GB PC can demonstrate text-only questions with `llama3.2:3b`, but image-aware answers with `llava:7b` need more memory.
+- Internet access only on the preparation machine for installers, Python packages, model weights, and Ollama models.
+
+### Windows native setup while connected
+
+Install Python and Ollama, then open PowerShell in the project directory:
+
+```powershell
+cd "$HOME\URSC_RAG"
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\scripts\setup_native.ps1
+```
+
+The setup script creates `.venv`, installs `requirements.txt`, and downloads the embedding and EasyOCR weights into `models/`. It does not use Docker or WSL.
+
+Start Ollama in a separate PowerShell window so its model files remain inside the project:
+
+```powershell
+cd "$HOME\URSC_RAG"
+.\scripts\run_ollama.ps1
+```
+
+In a third PowerShell window, download the language models:
+
+```powershell
+cd "$HOME\URSC_RAG"
+ollama pull llama3.2:3b
+ollama pull llava:7b
+```
+
+Keep the Ollama window running. Start the application in another window:
+
+```powershell
+cd "$HOME\URSC_RAG"
+.\scripts\run_native.ps1
+```
+
+Check it at [http://127.0.0.1:8000](http://127.0.0.1:8000) and [http://127.0.0.1:8000/health](http://127.0.0.1:8000/health). The first upload creates `data/knowledge.sqlite3`; later uploads of the same bytes are deduplicated and do not create embeddings again.
+
+### Ubuntu native setup while connected
+
+Install Python and Ollama using your organization's approved packages, then run:
+
+```bash
+cd ~/URSC_RAG
+chmod +x scripts/*.sh
+./scripts/setup_native.sh
+```
+
+Start Ollama in one terminal:
+
+```bash
+cd ~/URSC_RAG
+./scripts/run_ollama.sh
+```
+
+In a second terminal, download the models:
+
+```bash
+cd ~/URSC_RAG
+ollama pull llama3.2:3b
+ollama pull llava:7b
+```
+
+In a third terminal, start FastAPI:
+
+```bash
+cd ~/URSC_RAG
+./scripts/run_native.sh
+```
+
+Open [http://127.0.0.1:8000](http://127.0.0.1:8000). Keep the Ollama and FastAPI terminals running while using the application.
+
+### Prepare a transferable offline bundle
+
+Do this on the connected preparation machine after the native setup succeeds. The wheel files must be prepared separately for Windows and Ubuntu:
+
+```powershell
+cd "$HOME\URSC_RAG"
+New-Item -ItemType Directory -Force .\offline-bundle\wheels | Out-Null
+python -m pip download --only-binary=:all: -r requirements.txt -d .\offline-bundle\wheels
+```
+
+On Ubuntu, run the equivalent commands:
+
+```bash
+cd ~/URSC_RAG
+mkdir -p offline-bundle/wheels
+python3 -m pip download --only-binary=:all: -r requirements.txt -d offline-bundle/wheels
+```
+
+Copy the following to removable media or an approved internal share:
+
+- The repository source files, including `models/` and the `offline-bundle/` directory.
+- The Python installer for the target operating system.
+- The native Ollama installer for the target operating system.
+- `data/` if already-indexed documents and embeddings should be transferred; otherwise create an empty `data/` directory on the target.
+
+Do not copy `.venv` between computers. It is rebuilt on the target from the local wheel files. Keep the `models/embeddings`, `models/easyocr`, and `models/ollama` directories; they contain the downloaded weights and language models needed offline.
+
+### Install the bundle on an isolated Windows PC
+
+Install Python and Ollama from the transferred installers, copy the project folder to the target PC, and run:
+
+```powershell
+cd "$HOME\URSC_RAG"
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\scripts\setup_native.ps1 -Offline -BundlePath "$HOME\URSC_RAG\offline-bundle"
+```
+
+Start the local Ollama model store and application in two separate PowerShell windows:
+
+```powershell
+cd "$HOME\URSC_RAG"
+.\scripts\run_ollama.ps1
+```
+
+```powershell
+cd "$HOME\URSC_RAG"
+.\scripts\run_native.ps1
+```
+
+No internet connection is required after the installers, wheel files, model directories, and source have been copied. Verify with `curl.exe http://127.0.0.1:8000/health`.
+
+### Install the bundle on an isolated Ubuntu PC
+
+Install Python and Ollama from approved offline packages, copy the project and bundle, and run:
+
+```bash
+cd ~/URSC_RAG
+chmod +x scripts/*.sh
+./scripts/setup_native.sh --offline ./offline-bundle
+```
+
+Start Ollama and FastAPI in separate terminals:
+
+```bash
+cd ~/URSC_RAG
+./scripts/run_ollama.sh
+```
+
+```bash
+cd ~/URSC_RAG
+./scripts/run_native.sh
+```
+
+Verify with `curl http://127.0.0.1:8000/health`. Documents, images, notebooks, and embeddings remain in `data/` across restarts. Back up that directory before replacing the computer.
+
+### Native lab-network access
+
+The helper scripts bind FastAPI to `127.0.0.1` by default. To allow trusted lab workstations to connect, set the bind address on the server before starting FastAPI:
+
+Windows PowerShell:
+
+```powershell
+$env:RAG_HOST = "0.0.0.0"
+.\scripts\run_native.ps1
+```
+
+Ubuntu:
+
+```bash
+RAG_HOST=0.0.0.0 ./scripts/run_native.sh
+```
+
+Allow only the lab subnet through the host firewall, then use `http://SERVER_IP:8000` from a workstation. Keep Ollama on `127.0.0.1:11434`; do not expose it to the network. Add authentication and HTTPS before using the service outside a trusted lab.
+
+### Native troubleshooting
+
+- **`python` is not recognized:** install Python 3.11 or newer and enable “Add Python to PATH”, then open a new terminal.
+- **`ollama` is not recognized:** install Ollama and open a new terminal, or add its installation directory to `PATH`.
+- **The application cannot connect to Ollama:** make sure `run_ollama` is running and that `ollama list` shows `llama3.2:3b`.
+- **Offline pip installation fails:** use a wheel bundle prepared on the same operating system, Python version, and CPU architecture as the target.
+- **A model download is attempted while offline:** confirm `models/embeddings`, `models/easyocr`, and `models/ollama` were copied and that the helper scripts set `HF_HUB_OFFLINE` and `TRANSFORMERS_OFFLINE`.
+- **Port 8000 is busy:** set another port, for example `RAG_PORT=8001 ./scripts/run_native.sh` on Ubuntu or `$env:RAG_PORT="8001"; .\scripts\run_native.ps1` on Windows.
 
 ## Connected installation (internet available once)
 
