@@ -85,6 +85,61 @@ curl http://127.0.0.1:8000/health
 
 Open the user interface at [http://127.0.0.1:8000](http://127.0.0.1:8000) and the API documentation at [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs).
 
+### Complete first-install sequence
+
+For a clean Ubuntu PC, the full order is:
+
+```bash
+# 1. Install Docker and Compose (internet required for this step).
+sudo apt update
+sudo apt install -y ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt update
+sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$USER"
+
+# Start a new login session after the usermod command, then verify Docker.
+docker --version
+docker compose version
+docker run --rm hello-world
+
+# 2. Download this project (internet required for this step).
+git clone https://github.com/dhxvxn/URSC_RAG.git
+cd URSC_RAG
+
+# 3. Build the application image. This downloads Python packages and embeds
+#    the sentence-embedding and EasyOCR weights into the image.
+docker compose build
+
+# 4. Start the private API and the local Ollama service.
+docker compose up -d
+
+# 5. Download the language models into the persistent Ollama volume.
+docker compose exec ollama ollama pull llama3.2:3b
+docker compose exec ollama ollama pull llava:7b
+
+# 6. Verify the complete deployment.
+docker compose ps
+docker compose exec ollama ollama list
+curl http://127.0.0.1:8000/health
+```
+
+After the health check succeeds, open `http://127.0.0.1:8000`, create a notebook, select a folder, and click **Index selected files**. The service is now ready to run without internet. To start it later, only run `docker compose up -d`; do not rebuild or pull models on the isolated machine.
+
+To update an existing connected installation:
+
+```bash
+cd URSC_RAG
+git pull --ff-only origin main
+docker compose build
+docker compose up -d
+```
+
+
 ## First demonstration on one Ubuntu PC
 
 Use an SSD and at least 16 GB RAM for a comfortable demonstration. The text model is kept warm in Ollama, and the embedding model is loaded once when the API starts. The default Compose binding is loopback-only, so another machine cannot reach the service:
