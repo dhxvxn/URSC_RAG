@@ -1,142 +1,194 @@
-# Offline Multi-Document QA System and MCP Server
+# Offline Notebook Document QA
 
-This project is a local, privacy-first question-answering system for PDF, Word, and Excel files. It provides a FastAPI web interface and a Model Context Protocol (MCP) server for local AI assistants. Documents are processed locally and sent only to the Ollama service running on the same machine.
+This project is a private, Docker-based document question-answering system for a lab or secure office. It accepts PDF, Word, Excel, and image files, extracts text and OCR content, creates local embeddings once, and stores everything in persistent Docker volumes. Questions are scoped to a selected notebook, so a user can keep separate collections such as **Propulsion**, **Mission Reports**, or **Finance**.
 
-## Features
+The application runs locally with FastAPI and Ollama. After the connected installation is complete, the containers, embedding model, OCR model, language model, documents, images, SQLite catalog, and embeddings can run without internet access.
 
-- PDF text extraction with EasyOCR fallback for image-only pages.
-- Word (`.docx`) paragraph extraction.
-- Excel (`.xlsx` and `.xls`) sheet extraction with pandas.
-- Content-hash caching, so the same file is not extracted again.
-- FastAPI web interface for selecting a folder and asking a question.
-- MCP tool for scanning a local folder from an MCP-compatible assistant.
-- Local Ollama inference with the `llama3` model by default.
-- Extracted text and the document registry are stored in `doc_cache/`.
+## What is included
 
-The current implementation caches extracted text. It does not create a persistent vector index or knowledge graph.
+- Persistent notebooks with a separate document collection for each topic or project.
+- PDF, DOCX, XLSX, XLS, PNG, JPEG, TIFF, BMP, and WebP ingestion.
+- SHA-256 document deduplication. Uploading the same file again links it to the notebook without extracting or embedding it again.
+- Incremental indexing. Add another file or folder later and index only new or changed files.
+- Local \`all-MiniLM-L6-v2\` sentence embeddings stored in SQLite BLOBs.
+- Cosine-similarity retrieval restricted to the selected notebook.
+- PDF page text extraction, scanned-PDF OCR, DOCX/XLSX embedded-image extraction, and image OCR.
+- Persistent image storage and source URLs in API responses.
+- Optional Ollama vision answering with \`llava\`; without a vision model, image OCR still participates in retrieval and the image is returned as a source.
+- Extractive fallback answers when Ollama is stopped or unavailable.
+- FastAPI web UI, Swagger API at \`/docs\`, and MCP tools for notebook operations.
+- No cloud API is needed at runtime.
 
-## Ubuntu/Linux setup
+The persistent data is kept in the Docker volume \`rag_data\`; Ollama model files are kept in \`ollama_models\`. Removing containers does not remove these volumes.
 
-The commands below assume Ubuntu 22.04 or newer and a checkout at `~/URSC_RAG`.
+## Connected installation (internet available once)
 
-### 1. Install system packages
+The following procedure is for an Ubuntu/Linux machine that will become the lab server. Install Docker and the Compose plugin using your approved system process. The Docker image build downloads Python packages and warms the embedding and EasyOCR models; Ollama downloads its language models. After these steps, the server can be disconnected from the internet.
 
-```bash
+\`\`\`bash
 sudo apt update
-sudo apt install -y python3 python3-venv python3-dev build-essential
-sudo apt install -y libgl1 libglib2.0-0
-```
+sudo apt install -y docker.io docker-compose-plugin
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$USER"
+\`\`\`
 
-### 2. Clone or update the repository
+Log out and back in once after adding yourself to the \`docker\` group. Then clone the repository:
 
-```bash
-git clone https://github.com/dhxvxn/URSC_RAG.git ~/URSC_RAG
-cd ~/URSC_RAG
-```
+\`\`\`bash
+git clone https://github.com/dhxvxn/URSC_RAG.git
+cd URSC_RAG
+\`\`\`
 
-For an existing checkout:
+Build the application image while internet is available:
 
-```bash
-cd ~/URSC_RAG
-git pull --ff-only origin main
-```
+\`\`\`bash
+docker compose build
+\`\`\`
 
-### 3. Create and activate the virtual environment
+Start both services:
 
-```bash
-cd ~/URSC_RAG
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip wheel
-python -m pip install fastapi uvicorn 'mcp<2' pymupdf easyocr python-docx pandas openpyxl xlrd httpx numpy python-multipart
-python -m pip check
-```
+\`\`\`bash
+docker compose up -d
+\`\`\`
 
-Activate it again in each new terminal:
+Download the local language models into the persistent Ollama volume:
 
-```bash
-cd ~/URSC_RAG
-source .venv/bin/activate
-```
+\`\`\`bash
+docker compose exec ollama ollama pull llama3.2:3b
+docker compose exec ollama ollama pull llava:7b
+\`\`\`
 
-The first EasyOCR startup may download model files. In a restricted office, transfer and verify those files through the approved process before running the application.
+\`llava:7b\` is used when a retrieved source includes images. If the server cannot hold that model, set \`OLLAMA_VISION_MODEL\` to another installed vision model in a \`.env\` file. The application still indexes image OCR when no vision model is available.
 
-### 4. Install and prepare Ollama
+Check the services:
 
-Install Ollama using its official Linux instructions. Start it in a separate terminal:
+\`\`\`bash
+docker compose ps
+curl http://127.0.0.1:8000/health
+\`\`\`
 
-```bash
-ollama serve
-```
+Open the user interface at [http://127.0.0.1:8000](http://127.0.0.1:8000) and the API documentation at [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs).
 
-In another terminal:
+## Running fully offline
 
-```bash
-ollama pull llama3
-curl http://127.0.0.1:11434/api/tags
-```
+The application image contains the embedding and EasyOCR weights. The Ollama models are in the \`ollama_models\` Docker volume. Once \`docker compose build\` and both \`ollama pull\` commands have completed, disconnect the server from the internet and start normally:
 
-The application calls `http://localhost:11434/api/chat` and uses `llama3` by default.
+\`\`\`bash
+docker compose up -d
+\`\`\`
 
-## Run the web application
+To move the prepared deployment to an isolated machine, export the images and volumes while the connected machine is stopped:
 
-For laptop-only use, bind the service to loopback:
+\`\`\`bash
+docker compose down
+mkdir -p offline-bundle
+docker image ls
+# Use the exact RAG image name shown by the previous command.
+docker save -o offline-bundle/ollama-image.tar ollama/ollama:latest
+docker save -o offline-bundle/rag-image.tar ursc_rag-rag:latest
+docker run --rm -v ursc_rag_ollama_models:/source -v "$PWD/offline-bundle:/backup" alpine \
+  tar czf /backup/ollama-models.tar.gz -C /source .
+docker run --rm -v ursc_rag_rag_data:/source -v "$PWD/offline-bundle:/backup" alpine \
+  tar czf /backup/rag-data.tar.gz -C /source .
+\`\`\`
 
-```bash
-cd ~/URSC_RAG
-source .venv/bin/activate
-EASYOCR_MODULE_PATH="$PWD/.easyocr" python -m uvicorn main:app --host 127.0.0.1 --port 8000
-```
+Copy \`offline-bundle/\` and the repository to the isolated machine. Load the images and restore the volumes:
 
-Open `http://127.0.0.1:8000`. If you run `python main.py` directly, the prototype binds to `0.0.0.0:8000`; use that only behind an office firewall or authenticated HTTPS reverse proxy. There is no built-in user authentication.
+\`\`\`bash
+docker load -i offline-bundle/ollama-image.tar
+docker load -i offline-bundle/rag-image.tar
+docker volume create ursc_rag_ollama_models
+docker volume create ursc_rag_rag_data
+docker run --rm -v ursc_rag_ollama_models:/target -v "$PWD/offline-bundle:/backup" alpine \
+  tar xzf /backup/ollama-models.tar.gz -C /target
+docker run --rm -v ursc_rag_rag_data:/target -v "$PWD/offline-bundle:/backup" alpine \
+  tar xzf /backup/rag-data.tar.gz -C /target
+docker compose up -d
+\`\`\`
 
-## Use the API
+Do not run \`docker compose build\` on the isolated machine unless all build layers and package caches have already been transferred. The normal offline operation is \`docker compose up -d\` using the loaded image.
 
-The browser uses `POST /api/qa/upload_folder`. It accepts a multipart form with `question` and one or more `files` fields:
+## Notebook workflow
 
-```bash
-curl -X POST http://127.0.0.1:8000/api/qa/upload_folder \
-  -F 'question=What is the parasite drag coefficient?' \
-  -F 'files=@/home/YOUR_USER/documents/handbook.pdf' \
-  -F 'files=@/home/YOUR_USER/documents/report.docx' \
-  -F 'files=@/home/YOUR_USER/documents/budget.xlsx'
-```
+1. Open the web UI.
+2. Create a notebook such as \`Mission Reports\`.
+3. Select files or an entire folder and click **Index selected files**.
+4. Ask questions while that notebook is selected.
+5. Add more files later and index them again. Existing files are reported as \`cached\`; new or changed files are embedded once.
 
-The response contains `files_used` and `answer`. Supported extensions are `.pdf`, `.docx`, `.xlsx`, and `.xls`; other files are skipped. The cache avoids repeated extraction, but the current browser workflow still requires selecting files for each question.
+The database keeps a content hash, so the same document can be linked into several notebooks without duplicate storage or embedding work. A changed document receives a new hash and is indexed as a new version. Documents are never sent to a cloud service.
 
-## Run the MCP server
+## API examples
 
-```bash
-cd ~/URSC_RAG
-source .venv/bin/activate
-EASYOCR_MODULE_PATH="$PWD/.easyocr" python mcp_server.py
-```
+Create a notebook:
 
-Example MCP client configuration:
+\`\`\`bash
+curl -X POST http://127.0.0.1:8000/api/notebooks \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Mission Reports"}'
+\`\`\`
 
-```json
-{
-  "mcpServers": {
-    "offline-document-qa": {
-      "command": "/home/YOUR_USER/URSC_RAG/.venv/bin/python",
-      "args": ["/home/YOUR_USER/URSC_RAG/mcp_server.py"],
-      "cwd": "/home/YOUR_USER/URSC_RAG"
-    }
-  }
-}
-```
+Use the returned notebook ID to index files:
 
-The MCP tool is `query_local_documents(folder_path, question)`.
+\`\`\`bash
+curl -X POST http://127.0.0.1:8000/api/notebooks/NOTEBOOK_ID/documents \
+  -F 'files=@/srv/documents/report.pdf' \
+  -F 'files=@/srv/documents/figures.png'
+\`\`\`
 
-## Privacy and troubleshooting
+Ask a question without uploading the files again:
 
-`doc_cache/registry.json` and the extracted text cache contain office content. Keep the directory on encrypted storage and include it in backups. The repository ignores `doc_cache/`, generated test documents, Python bytecode, `.env`, and `.venv/`.
+\`\`\`bash
+curl -X POST http://127.0.0.1:8000/api/notebooks/NOTEBOOK_ID/ask \
+  -H 'Content-Type: application/json' \
+  -d '{"question":"What is the reported mission lifetime?","top_k":8}'
+\`\`\`
 
-```bash
-source .venv/bin/activate
-python -m pip check
-curl http://127.0.0.1:11434/api/tags
-python -m compileall -q main.py mcp_server.py create_test_folder.py
-```
+The response contains the answer, matched passages, page numbers, and image URLs such as \`/media/images/...\`. Open an image through the API host when reviewing evidence.
 
-If `mcp.server.fastmcp` cannot be imported, install the MCP v1-compatible package with `python -m pip install --upgrade 'mcp<2'`. If the API returns an empty answer, confirm that Ollama is running and `llama3` appears in `/api/tags`. If scanned PDFs are not recognized, confirm that EasyOCR model files are available.
+## Lab network access
+
+By default, port \`8000\` is published for the lab API and web UI. Ollama is bound only to \`127.0.0.1\` on the host and is not exposed to lab clients. Restrict port 8000 to the lab subnet with the host firewall:
+
+\`\`\`bash
+sudo ufw allow from 192.168.10.0/24 to any port 8000 proto tcp
+sudo ufw enable
+\`\`\`
+
+Clients can then open \`http://SERVER_IP:8000\` and \`http://SERVER_IP:8000/docs\`. The current application does not provide user authentication; keep it on a trusted subnet or place it behind an authenticated reverse proxy before exposing it beyond the lab.
+
+## MCP
+
+The MCP adapter uses the same persistent database and embeddings as the API:
+
+\`\`\`bash
+docker compose exec rag python mcp_server.py
+\`\`\`
+
+For a local MCP client, configure stdio with the Python interpreter in the checkout. The available tools are \`list_notebooks\`, \`create_notebook\`, \`ingest_folder\`, and \`ask_notebook\`. \`ingest_folder\` recursively scans supported files and reuses the content-hash index on later runs.
+
+## Storage and backups
+
+Back up both persistent volumes. \`rag_data\` contains the SQLite catalog, original documents, extracted images, and embeddings. \`ollama_models\` contains the language models. A backup made while the services are stopped is the simplest consistent backup:
+
+\`\`\`bash
+docker compose down
+# export the two volumes using the tar commands in the offline-bundle section
+docker compose up -d
+\`\`\`
+
+Protect the backup files because they contain office documents and image extracts.
+
+## Troubleshooting
+
+\`\`\`bash
+docker compose logs -f rag
+docker compose logs -f ollama
+curl http://127.0.0.1:8000/health
+docker compose exec ollama ollama list
+\`\`\`
+
+- If the app reports an embedding-model error, rebuild the image while connected: \`docker compose build --no-cache\`.
+- If image answers fall back to OCR, confirm that \`llava:7b\` appears in \`docker compose exec ollama ollama list\` and that \`OLLAMA_VISION_MODEL\` matches its name.
+- If a repeated upload is not marked \`cached\`, the file bytes changed; this is intentional and creates a new indexed version.
+- If the host is low on memory, use a smaller Ollama text or vision model and reduce \`top_k\`.

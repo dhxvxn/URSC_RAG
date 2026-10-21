@@ -1,0 +1,34 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes:
+      - ollama_models:/root/.ollama
+    # Ollama is used only by the app container. Do not expose it to the LAN.
+    ports:
+      - "127.0.0.1:11434:11434"
+
+  rag:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - ollama
+    environment:
+      DATA_DIR: /data
+      EMBEDDING_MODEL_DIR: /models/embeddings/all-MiniLM-L6-v2
+      EASYOCR_MODULE_PATH: /models/easyocr
+      OLLAMA_BASE_URL: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:3b}
+      OLLAMA_VISION_MODEL: ${OLLAMA_VISION_MODEL:-llava:7b}
+    volumes:
+      - rag_data:/data
+    ports:
+      - "8000:8000"
+
+volumes:
+  rag_data:
+    name: ursc_rag_rag_data
+  ollama_models:
+    name: ursc_rag_ollama_models
