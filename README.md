@@ -23,16 +23,32 @@ The persistent data is kept in the Docker volume `rag_data`; Ollama model files 
 
 ## Connected installation (internet available once)
 
-The following procedure is for an Ubuntu/Linux machine that will become the lab server. Install Docker and the Compose plugin using your approved system process. The Docker image build downloads Python packages and warms the embedding and EasyOCR models; Ollama downloads its language models. After these steps, the server can be disconnected from the internet.
+The following procedure is for an Ubuntu 22.04/24.04 machine that will become the lab server. Internet is required only for Docker installation, the first image build, and the initial model downloads. After these steps, the server can be disconnected from the internet.
+
+Install Docker Engine and the Compose plugin from Docker's Ubuntu repository:
 
 ```bash
 sudo apt update
-sudo apt install -y docker.io docker-compose-plugin
+sudo apt install -y ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt update
+sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 sudo systemctl enable --now docker
 sudo usermod -aG docker "$USER"
 ```
 
-Log out and back in once after adding yourself to the `docker` group. Then clone the repository:
+Log out and back in once after adding yourself to the `docker` group. Verify the installation:
+
+```bash
+docker --version
+docker compose version
+docker run --rm hello-world
+```
+
+Then clone the repository:
 
 ```bash
 git clone https://github.com/dhxvxn/URSC_RAG.git
@@ -146,6 +162,26 @@ docker compose up -d
 ```
 
 Do not run `docker compose build` on the isolated machine unless all build layers and package caches have already been transferred. The normal offline operation is `docker compose up -d` using the loaded image.
+
+## Persistent embeddings and later uploads
+
+The first successful upload performs extraction/OCR, creates chunks, generates embeddings, writes them to `/data/knowledge.sqlite3`, and stores the original files and extracted images under `/data`. `/data` is mounted from the named Docker volume `ursc_rag_rag_data`, so the catalog and embeddings survive:
+
+- `docker compose restart`
+- `docker compose down` followed by `docker compose up -d`
+- application image rebuilds
+- host reboots
+
+The same file is identified by its SHA-256 hash. Uploading it again returns `cached`, links it to the selected notebook, and does not extract or embed it again. A new file is indexed once; a modified file has a new hash and is indexed as a new version. Questions use the saved embeddings and never require the source files to be uploaded again.
+
+Do **not** run `docker compose down -v` unless you intentionally want to delete the document catalog, embeddings, and uploaded files. Back up `ursc_rag_rag_data` before moving or reinstalling the server. The Ollama model volume `ursc_rag_ollama_models` is separate and must also be backed up for a completely offline restore.
+
+To confirm that the persistent data volume exists:
+
+```bash
+docker volume inspect ursc_rag_rag_data
+docker compose exec rag ls -lh /data/knowledge.sqlite3
+```
 
 ## Notebook workflow
 
