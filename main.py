@@ -11,8 +11,10 @@ import base64
 import hashlib
 import io
 import os
+import re
 import sqlite3
 import threading
+import time
 import uuid
 import zipfile
 from datetime import datetime, timezone
@@ -43,7 +45,12 @@ EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434").rstrip("/")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
 OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "llava:7b")
-TOP_K_DEFAULT = int(os.getenv("TOP_K_DEFAULT", "8"))
+OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "-1")
+TOP_K_DEFAULT = int(os.getenv("TOP_K_DEFAULT", "6"))
+MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "12000"))
+MAX_VISION_IMAGES = int(os.getenv("MAX_VISION_IMAGES", "2"))
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
+OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "512"))
 
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".xlsx", ".xls", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
@@ -51,6 +58,9 @@ DB_LOCK = threading.RLock()
 _embedding_model: SentenceTransformer | None = None
 _ocr_reader: Any = None
 _ocr_lock = threading.Lock()
+_retrieval_cache: dict[str, tuple[int, np.ndarray, list[dict[str, Any]]]] = {}
+_retrieval_generation = 0
+_retrieval_cache_lock = threading.RLock()
 
 
 def utc_now() -> str:
@@ -119,6 +129,33 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_images_document ON images(document_id);
             """
         )
+        # FTS5 provides a fast lexical signal for names, acronyms, identifiers,
+        # and exact terminology that semantic embeddings can underweight.
+        try:
+            connection.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5(text, content='chunks', content_rowid='id')"
+            )
+            connection.executescript(
+                """
+                CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
+                    INSERT INTO chunk_fts(rowid, text) VALUES (new.id, new.text);
+                END;
+                CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
+                    INSERT INTO chunk_fts(chunk_fts, rowid, text) VALUES ('delete', old.id, old.text);
+                END;
+                CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
+                    INSERT INTO chunk_fts(chunk_fts, rowid, text) VALUES ('delete', old.id, old.text);
+                    INSERT INTO chunk_fts(rowid, text) VALUES (new.id, new.text);
+                END;
+                """
+            )
+            fts_count = connection.execute("SELECT COUNT(*) FROM chunk_fts").fetchone()[0]
+            chunk_count = connection.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+            if fts_count != chunk_count:
+                connection.execute("INSERT INTO chunk_fts(chunk_fts) VALUES ('rebuild')")
+        except sqlite3.OperationalError:
+            # Python builds without FTS5 still work with semantic retrieval.
+            pass
 
 
 def sha256_bytes(content: bytes) -> str:
@@ -292,6 +329,66 @@ def embed_texts(texts: list[str]) -> np.ndarray:
     return np.asarray(vectors, dtype=np.float32)
 
 
+def invalidate_retrieval_cache() -> None:
+    global _retrieval_generation
+    with _retrieval_cache_lock:
+        _retrieval_generation += 1
+        _retrieval_cache.clear()
+
+
+def notebook_index(notebook_id: str) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    """Load one notebook's embeddings once and reuse them for later questions."""
+    with _retrieval_cache_lock:
+        cached = _retrieval_cache.get(notebook_id)
+        if cached and cached[0] == _retrieval_generation:
+            return cached[1], cached[2]
+    with db() as connection:
+        rows = connection.execute(
+            """
+            SELECT c.id, c.document_id, c.page, c.text, c.embedding, d.filename
+            FROM chunks c
+            JOIN notebook_documents nd ON nd.document_id = c.document_id
+            JOIN documents d ON d.id = c.document_id
+            WHERE nd.notebook_id = ? ORDER BY c.id
+            """,
+            (notebook_id,),
+        ).fetchall()
+    metadata = [
+        {"id": row["id"], "document_id": row["document_id"], "filename": row["filename"], "page": row["page"], "text": row["text"]}
+        for row in rows
+    ]
+    if rows:
+        matrix = np.vstack([np.frombuffer(row["embedding"], dtype=np.float32) for row in rows]).astype(np.float32, copy=False)
+    else:
+        matrix = np.empty((0, 0), dtype=np.float32)
+    with _retrieval_cache_lock:
+        _retrieval_cache[notebook_id] = (_retrieval_generation, matrix, metadata)
+    return matrix, metadata
+
+
+def lexical_candidates(notebook_id: str, question: str, limit: int) -> list[int]:
+    terms = re.findall(r"[A-Za-z0-9_]{2,}", question.lower())
+    if not terms:
+        return []
+    match_expression = " OR ".join(f'"{term.replace(chr(34), "")}"' for term in terms[:24])
+    try:
+        with db() as connection:
+            rows = connection.execute(
+                """
+                SELECT c.id
+                FROM chunk_fts
+                JOIN chunks c ON c.id = chunk_fts.rowid
+                JOIN notebook_documents nd ON nd.document_id = c.document_id
+                WHERE nd.notebook_id = ? AND chunk_fts MATCH ?
+                ORDER BY bm25(chunk_fts) LIMIT ?
+                """,
+                (notebook_id, match_expression, limit),
+            ).fetchall()
+        return [int(row["id"]) for row in rows]
+    except sqlite3.OperationalError:
+        return []
+
+
 def notebook_exists(notebook_id: str) -> bool:
     with db() as connection:
         return connection.execute("SELECT 1 FROM notebooks WHERE id = ?", (notebook_id,)).fetchone() is not None
@@ -322,6 +419,7 @@ def ingest_document(notebook_id: str, filename: str, content: bytes) -> dict[str
         existing = connection.execute("SELECT id FROM documents WHERE sha256 = ?", (digest,)).fetchone()
         if existing:
             connection.execute("INSERT OR IGNORE INTO notebook_documents(notebook_id, document_id, source_name, added_at) VALUES (?, ?, ?, ?)", (notebook_id, existing["id"], safe_filename, utc_now()))
+            invalidate_retrieval_cache()
             return {"filename": safe_filename, "status": "cached", "document_id": existing["id"]}
     try:
         sections, extracted_images = extract_document(content, safe_filename)
@@ -354,6 +452,7 @@ def ingest_document(notebook_id: str, filename: str, content: bytes) -> dict[str
         for page, relative_path, mime_type, ocr_text in image_rows:
             connection.execute("INSERT INTO images(document_id, page, stored_path, mime_type, ocr_text) VALUES (?, ?, ?, ?, ?)", (document_id, page, relative_path, mime_type, ocr_text))
         connection.execute("INSERT INTO notebook_documents(notebook_id, document_id, source_name, added_at) VALUES (?, ?, ?, ?)", (notebook_id, document_id, safe_filename, utc_now()))
+    invalidate_retrieval_cache()
     return {"filename": safe_filename, "status": "indexed", "document_id": document_id, "chunks": len(flattened), "images": len(image_rows)}
 
 
@@ -361,17 +460,32 @@ def retrieve(notebook_id: str, question: str, top_k: int) -> tuple[list[dict[str
     if not notebook_exists(notebook_id):
         raise HTTPException(status_code=404, detail="Notebook not found")
     query_vector = embed_texts([question])[0]
+    matrix, metadata = notebook_index(notebook_id)
+    if not metadata:
+        return [], []
+    candidate_limit = max(top_k * 8, 40)
+    semantic_scores = matrix @ query_vector
+    semantic_order = np.argsort(-semantic_scores)[: min(candidate_limit, len(metadata))]
+    lexical_ids = lexical_candidates(notebook_id, question, candidate_limit)
+    metadata_by_id = {item["id"]: item for item in metadata}
+    fused_scores: dict[int, float] = {}
+    semantic_values: dict[int, float] = {}
+    # Reciprocal-rank fusion makes exact terms and semantic similarity
+    # complementary without requiring a collection-specific score threshold.
+    for rank, index in enumerate(semantic_order, start=1):
+        chunk_id = metadata[index]["id"]
+        fused_scores[chunk_id] = fused_scores.get(chunk_id, 0.0) + 1.0 / (60.0 + rank)
+        semantic_values[chunk_id] = float(semantic_scores[index])
+    for rank, chunk_id in enumerate(lexical_ids, start=1):
+        fused_scores[chunk_id] = fused_scores.get(chunk_id, 0.0) + 1.0 / (60.0 + rank)
+    selected_ids = sorted(fused_scores, key=lambda chunk_id: fused_scores[chunk_id], reverse=True)[: max(1, min(top_k, 20))]
+    hits = [
+        {**metadata_by_id[chunk_id], "score": round(semantic_values.get(chunk_id, 0.0), 4), "hybrid_score": round(fused_scores[chunk_id], 6)}
+        for chunk_id in selected_ids
+    ]
     with db() as connection:
-        rows = connection.execute("SELECT c.id, c.document_id, c.page, c.text, c.embedding, d.filename FROM chunks c JOIN notebook_documents nd ON nd.document_id = c.document_id JOIN documents d ON d.id = c.document_id WHERE nd.notebook_id = ?", (notebook_id,)).fetchall()
-        scored: list[tuple[float, sqlite3.Row]] = []
-        for row in rows:
-            vector = np.frombuffer(row["embedding"], dtype=np.float32)
-            scored.append((float(np.dot(query_vector, vector)), row))
-        scored.sort(key=lambda value: value[0], reverse=True)
-        selected = scored[: max(1, min(top_k, 20))]
-        hits = [{"document_id": row["document_id"], "filename": row["filename"], "page": row["page"], "text": row["text"], "score": round(score, 4)} for score, row in selected]
         images: list[dict[str, Any]] = []
-        for document_id in {row["document_id"] for _, row in selected}:
+        for document_id in {item["document_id"] for item in hits}:
             image_rows = connection.execute("SELECT document_id, page, stored_path, mime_type, ocr_text FROM images WHERE document_id = ? LIMIT 6", (document_id,)).fetchall()
             images.extend(dict(row) for row in image_rows)
     return hits, images[:12]
@@ -392,9 +506,9 @@ async def ask_ollama(question: str, hits: list[dict[str, Any]], images: list[dic
     context = "\n\n".join(f"[{hit['filename']} page {hit['page'] or 'n/a'}]\n{hit['text']}" for hit in hits)
     prompt = ("Answer using only the supplied notebook sources. Cite the filename and page when available. "
               "If the sources do not contain the answer, say so. Describe relevant images or diagrams when they help.\n\n"
-              f"Sources:\n{context[:18000]}\n\nQuestion: {question}")
+              f"Sources:\n{context[:MAX_CONTEXT_CHARS]}\n\nQuestion: {question}")
     image_payload: list[str] = []
-    for image in images[:4]:
+    for image in images[:MAX_VISION_IMAGES]:
         try:
             image_payload.append(base64.b64encode((DATA_DIR / image["stored_path"]).read_bytes()).decode("ascii"))
         except OSError:
@@ -405,7 +519,16 @@ async def ask_ollama(question: str, hits: list[dict[str, Any]], images: list[dic
         message["images"] = image_payload
     try:
         async with httpx.AsyncClient(timeout=180) as client:
-            response = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json={"model": model, "messages": [{"role": "system", "content": "You are an offline document research assistant."}, message], "stream": False})
+            response = await client.post(
+                f"{OLLAMA_BASE_URL}/api/chat",
+                json={
+                    "model": model,
+                    "messages": [{"role": "system", "content": "You are an offline document research assistant."}, message],
+                    "stream": False,
+                    "keep_alive": OLLAMA_KEEP_ALIVE,
+                    "options": {"num_ctx": OLLAMA_NUM_CTX, "num_predict": OLLAMA_NUM_PREDICT, "temperature": 0.1},
+                },
+            )
             response.raise_for_status()
             answer = response.json().get("message", {}).get("content", "").strip()
             return answer or None
@@ -427,13 +550,24 @@ init_db()
 app.mount("/media", StaticFiles(directory=str(DATA_DIR)), name="media")
 
 
+@app.on_event("startup")
+async def warm_up() -> None:
+    # Loading the small embedding model once at startup removes the first-query
+    # penalty. A missing model is reported on the first indexing request.
+    if os.getenv("PRELOAD_EMBEDDING_MODEL", "1").lower() not in {"0", "false", "no"}:
+        try:
+            get_embedding_model()
+        except Exception:
+            pass
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     with db() as connection:
         notebook_count = connection.execute("SELECT COUNT(*) FROM notebooks").fetchone()[0]
         document_count = connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
         chunk_count = connection.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-    return {"status": "ok", "notebooks": notebook_count, "documents": document_count, "chunks": chunk_count, "ollama": OLLAMA_BASE_URL}
+    return {"status": "ok", "notebooks": notebook_count, "documents": document_count, "chunks": chunk_count, "ollama": OLLAMA_BASE_URL, "retrieval": "hybrid in-memory embeddings + SQLite FTS5"}
 
 
 @app.get("/api/notebooks")
@@ -472,9 +606,12 @@ async def upload_documents(notebook_id: str, files: List[UploadFile] = File(...)
 
 @app.post("/api/notebooks/{notebook_id}/ask")
 async def ask_notebook(notebook_id: str, request: AskRequest) -> dict[str, Any]:
+    started = time.perf_counter()
     hits, images = retrieve(notebook_id, request.question, request.top_k)
+    retrieved_ms = round((time.perf_counter() - started) * 1000, 1)
+    answer_started = time.perf_counter()
     answer = await ask_ollama(request.question, hits, images)
-    return {"notebook_id": notebook_id, "answer": answer or extractive_fallback(hits), "sources": [{**hit, "image_urls": [f"/media/{image['stored_path']}" for image in images if image["document_id"] == hit["document_id"] and (not hit["page"] or image["page"] == hit["page"])]} for hit in hits], "images": [{**image, "url": f"/media/{image['stored_path']}"} for image in images], "retrieval": "embedding cosine similarity"}
+    return {"notebook_id": notebook_id, "answer": answer or extractive_fallback(hits), "sources": [{**hit, "image_urls": [f"/media/{image['stored_path']}" for image in images if image["document_id"] == hit["document_id"] and (not hit["page"] or image["page"] == hit["page"])]} for hit in hits], "images": [{**image, "url": f"/media/{image['stored_path']}"} for image in images], "retrieval": "hybrid in-memory embeddings + SQLite FTS5", "timings_ms": {"retrieval": retrieved_ms, "answer": round((time.perf_counter() - answer_started) * 1000, 1)}}
 
 
 @app.get("/", response_class=HTMLResponse)
