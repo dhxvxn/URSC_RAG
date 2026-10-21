@@ -232,6 +232,136 @@ New-NetFirewallRule -DisplayName "Offline Document QA" -Direction Inbound -Proto
 
 Lab workstations can then open `http://WINDOWS_SERVER_IP:8000`. Keep port 11434 private; only the FastAPI port should be reachable from the lab.
 
+## Windows installation without WSL (Hyper-V backend)
+
+Use this option when WSL2 is not permitted. Docker Desktop can run this project with its **Hyper-V backend**, which uses Docker's own lightweight Linux virtual machine. The project still needs Linux containers, so Windows containers are not supported for this Compose file.
+
+This option requires Windows 10/11 **Pro, Enterprise, or Education**, a 64-bit processor with hardware virtualization and SLAT, at least 4 GB RAM, and administrator access. Windows Home does not provide the Hyper-V backend; use WSL2 or an Ubuntu virtual machine/server on Windows Home.
+
+### 1. Check Windows and virtualization support
+
+Press `Win + R`, run `winver`, and confirm the Windows edition. Hardware virtualization must be enabled in BIOS/UEFI. If your organization manages the PC, ask IT to enable Hyper-V and permit Docker Desktop.
+
+### 2. Enable Hyper-V and Windows containers
+
+Open **PowerShell as Administrator** and run each command separately:
+
+```powershell
+dism /online /enable-feature /featurename:Microsoft-Hyper-V /all /norestart
+dism /online /enable-feature /featurename:Containers /all /norestart
+```
+
+Restart Windows after the commands finish.
+
+### 3. Install Docker Desktop with Hyper-V
+
+Download Docker Desktop from [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop/). During installation, leave the **Use WSL 2 instead of Hyper-V** option unchecked if it is shown.
+
+After installation:
+
+1. Open Docker Desktop and wait for **Engine running**.
+2. Open **Settings → General**.
+3. Make sure **Use the WSL 2 based engine** is disabled.
+4. Select **Apply & Restart**.
+5. If Docker is using Windows containers, open the Docker tray menu and select **Switch to Linux containers**.
+6. Do not enable WSL Integration; this setup does not use WSL.
+
+Verify the backend from PowerShell:
+
+```powershell
+docker --version
+docker compose version
+docker info --format '{{.OSType}}'
+docker run --rm hello-world
+```
+
+The `docker info` command must print `linux`. If it prints `windows`, switch Docker Desktop to Linux containers and run the check again.
+
+### 4. Clone and build the project
+
+Run these commands one at a time. The first build needs internet access and can take 20–60 minutes because it installs Python packages and downloads the embedding and OCR model weights:
+
+```powershell
+cd "$HOME"
+git clone https://github.com/dhxvxn/URSC_RAG.git
+cd "$HOME\URSC_RAG"
+docker compose config
+docker compose --progress=plain build
+```
+
+If the repository is already present, skip `git clone` and enter the folder that contains `docker-compose.yml`:
+
+```powershell
+cd "$HOME\URSC_RAG"
+Get-ChildItem docker-compose.yml
+docker compose --progress=plain build
+```
+
+Do not run `docker compose build` from `C:\Users\<name>` or another parent folder. Compose must run in the project directory.
+
+### 5. Start the services and download models
+
+```powershell
+docker compose up -d
+docker compose ps
+docker compose exec ollama ollama pull llama3.2:3b
+```
+
+For image-aware answers, download the optional vision model while internet is available:
+
+```powershell
+docker compose exec ollama ollama pull llava:7b
+```
+
+On an 8 GB PC, start with `llama3.2:3b` and add `llava:7b` only if the machine has enough free memory.
+
+Verify the application:
+
+```powershell
+curl.exe http://127.0.0.1:8000/health
+```
+
+Open the UI at [http://127.0.0.1:8000](http://127.0.0.1:8000) and the API documentation at [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs). Create a notebook, select a document folder, index the files, and ask a question.
+
+### 6. Run the Hyper-V installation offline
+
+After the image build and model downloads complete, disconnect the PC from the internet. The documents, embeddings, images, and Ollama models are stored in named Docker volumes and survive restarts and reboots:
+
+```powershell
+cd "$HOME\URSC_RAG"
+docker compose up -d
+docker compose ps
+```
+
+Do not run `docker compose build` or `ollama pull` while disconnected. Do not run `docker compose down -v`; it deletes the document database, embeddings, and uploaded files.
+
+### 7. Optional access from Windows lab workstations
+
+The default binding accepts connections only from the same PC. To expose the API to a trusted lab subnet, create `.env` beside `docker-compose.yml`:
+
+```dotenv
+RAG_BIND_ADDRESS=0.0.0.0
+```
+
+Restart the stack and allow only the lab subnet through Windows Firewall from an Administrator PowerShell:
+
+```powershell
+cd "$HOME\URSC_RAG"
+docker compose up -d
+New-NetFirewallRule -DisplayName "Offline Document QA" -Direction Inbound -Protocol TCP -LocalPort 8000 -RemoteAddress 192.168.10.0/24 -Action Allow
+ipconfig
+```
+
+Workstations can then open `http://WINDOWS_SERVER_IP:8000`. Keep port 11434 private; only port 8000 should be reachable from the lab. Add authentication and HTTPS before using the service outside a trusted network.
+
+### Hyper-V troubleshooting
+
+- **Hyper-V is unavailable:** confirm the Windows edition is Pro, Enterprise, or Education, enable CPU virtualization in BIOS/UEFI, and restart after enabling the features.
+- **`docker info` prints `windows`:** switch Docker Desktop to **Linux containers**.
+- **`no configuration file provided`:** run `cd "$HOME\URSC_RAG"` before every Compose command and confirm `Get-ChildItem docker-compose.yml` finds the file.
+- **The first build appears slow:** this is expected while packages and model weights download. Keep Docker Desktop and internet access active until the build completes.
+- **Services are unhealthy:** inspect logs with `docker compose logs --tail=100 rag` and `docker compose logs --tail=100 ollama`.
+
 
 
 
